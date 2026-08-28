@@ -150,6 +150,21 @@ type pipe struct {
 	pending    *frameBuffer
 }
 
+// sendOrBuffer re-checks serverData under the write lock before buffering.
+// The caller already observed a nil snapshot; without the re-check a concurrent
+// handover can drain pending and leave this frame stranded.
+func (p *pipe) sendOrBuffer(msgType int, msg []byte) error {
+	p.mu.Lock()
+	srv := p.serverData
+	if srv != nil {
+		p.mu.Unlock()
+		return srv.send(msgType, msg)
+	}
+	p.pending.push(msgType, msg)
+	p.mu.Unlock()
+	return nil
+}
+
 // isEmpty reports whether the pipe has no active connections and no buffered
 // frames — safe to remove from the pipes map.
 func (p *pipe) isEmpty() bool {
@@ -508,23 +523,27 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 
 	p := sess.getOrCreatePipe(connectionId)
 
+	// Atomically set serverData, swap out pending with a fresh buffer, and
+	// drain the captured frames under the write lock. Holding the lock
+	// during the drain keeps handleClient from sending a newer frame before
+	// the pre-buffered ones. Swapping pending means a late push cannot land
+	// in a buffer that will never be drained again.
 	p.mu.Lock()
 	old := p.serverData
 	p.serverData = c
-	p.mu.Unlock()
-	if old != nil {
-		old.close(1008, "Replaced by new connection")
-	}
-
-	// Flush frames that arrived before the daemon connected.
-	p.mu.Lock()
-	buf := p.pending
-	p.mu.Unlock()
-	for _, frame := range buf.flush() {
+	oldBuf := p.pending
+	p.pending = newFrameBuffer(sess.maxBufferFrames)
+	flushed := oldBuf.flush()
+	for _, frame := range flushed {
 		if len(frame) == 0 {
 			continue
 		}
 		_ = c.send(int(frame[0]), frame[1:])
+	}
+	p.mu.Unlock()
+
+	if old != nil {
+		old.close(1008, "Replaced by new connection")
 	}
 
 	defer func() {
@@ -617,7 +636,9 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 		p.mu.RUnlock()
 
 		if srv == nil {
-			p.pending.push(msgType, msg)
+			if err := p.sendOrBuffer(msgType, msg); err != nil {
+				slog.Error("forward client->server failed", "connectionId", connectionId, "err", err)
+			}
 			continue
 		}
 		if err := srv.send(msgType, msg); err != nil {
