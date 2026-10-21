@@ -393,6 +393,13 @@ type relayHandler struct {
 func (h *relayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/health":
+		// A 2xx reply to CONNECT turns the connection into a tunnel, which
+		// Go < 1.26.9 mishandles (CVE-2026-94439); only answer GET/HEAD.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		data, _ := json.Marshal(map[string]string{"status": "ok", "version": version})
 		_, _ = w.Write(data)

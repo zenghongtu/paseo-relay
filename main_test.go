@@ -1,10 +1,28 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/gorilla/websocket"
 )
+
+func TestHealthOnlyAnswersGetAndHead(t *testing.T) {
+	h := &relayHandler{reg: newRegistry(1)}
+	for method, want := range map[string]int{
+		http.MethodGet:     http.StatusOK,
+		http.MethodHead:    http.StatusOK,
+		http.MethodPost:    http.StatusMethodNotAllowed,
+		http.MethodConnect: http.StatusMethodNotAllowed,
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(method, "/health", nil))
+		if rec.Code != want {
+			t.Errorf("%s /health = %d, want %d", method, rec.Code, want)
+		}
+	}
+}
 
 func TestWebSocketMessageLimitMatchesHostedRelay(t *testing.T) {
 	const hostedRelayWebSocketMessageLimit = 32 * 1024 * 1024
