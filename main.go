@@ -651,6 +651,19 @@ func envOrDefault(key, def string) string {
 
 // ---- Main ----
 
+// newServer returns the relay's HTTP server. Its timeouts drop connections
+// that trickle request headers (slowloris) or idle between keep-alive
+// requests. They do not affect relayed sockets: gorilla clears the
+// connection deadlines when it upgrades a request to WebSocket.
+func newServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+}
+
 func main() {
 	addr := flag.String("addr", envOrDefault("RELAY_ADDR", ":8411"), "listen address")
 	maxBuf := flag.Int("max-buffer-frames", 200, "max frames buffered per connection while daemon is connecting")
@@ -679,10 +692,7 @@ func main() {
 	reg := newRegistry(*maxBuf)
 	reg.startEvictionLoop(ctx, 5*time.Minute)
 
-	srv := &http.Server{
-		Addr:    *addr,
-		Handler: &relayHandler{reg: reg},
-	}
+	srv := newServer(*addr, &relayHandler{reg: reg})
 
 	go func() {
 		slog.Info("paseo relay starting", "addr", *addr, "version", version)
