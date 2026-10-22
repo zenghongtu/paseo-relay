@@ -73,6 +73,7 @@ go build -o paseo-relay .
 |------|---------|--------|------|
 | `--addr` | `RELAY_ADDR` | `:8411` | 监听地址 |
 | `--max-buffer-frames` | — | `200` | 守护进程连接期间每个连接最多缓冲的帧数 |
+| `--max-message-memory` | — | `256` | 所有连接合计在内存中持有的消息数据上限（MiB）。用满后拒收新消息，发送方可能被以 1013 断开。`0` 表示不限制 |
 | `--log-format` | `LOG_FORMAT` | `text` | 日志格式：`text` 或 `json` |
 | `--version` | — | — | 打印版本并退出 |
 
@@ -147,6 +148,7 @@ TLS 应在上游终止（nginx、Caddy、Cloudflare 等）。
 - 中继服务器是零知识的 —— 无法读取或伪造消息。
 - 中继本身不做鉴权；安全性由 Paseo 的 ECDH + NaCl box 端到端加密保证。
 - 务必在上游终止 TLS，不要通过明文 HTTP 暴露中继。
+- 转发消息占用的内存受 `--max-message-memory` 限制。高负载时整个进程仍可能用到它的数倍（测试中最高约 4 倍）；可设置 `GOMEMLIMIT`（例如 `512MiB`）让占用更贴近该值。
 - 完整威胁模型请参见 [Paseo SECURITY.md](https://github.com/getpaseo/paseo/blob/main/SECURITY.md)。
 
 ## 许可证

@@ -73,6 +73,7 @@ go build -o paseo-relay .
 |------|---------|---------|-------------|
 | `--addr` | `RELAY_ADDR` | `:8411` | Listen address |
 | `--max-buffer-frames` | — | `200` | Max frames buffered per connection while daemon is connecting |
+| `--max-message-memory` | — | `256` | Max MiB of message data held in memory across all connections. When it is full, new messages are refused and their sender may be disconnected with code 1013. `0` = unlimited |
 | `--log-format` | `LOG_FORMAT` | `text` | Log format: `text` or `json` |
 | `--version` | — | — | Print version and exit |
 
@@ -147,6 +148,7 @@ Then restart the daemon: `paseo daemon stop && paseo daemon start`.
 - The relay is zero-knowledge — it cannot read or forge messages.
 - No authentication on the relay itself; security is enforced end-to-end by Paseo's ECDH + NaCl box encryption.
 - Always terminate TLS upstream; do not expose the relay over plain HTTP.
+- Memory held for relayed messages is capped by `--max-message-memory`. Under heavy load the whole process can still use several times that (up to about 4× in tests); set `GOMEMLIMIT` (for example `512MiB`) to keep it closer.
 - See [Paseo SECURITY.md](https://github.com/getpaseo/paseo/blob/main/SECURITY.md) for the full threat model.
 
 ## License

@@ -20,11 +20,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,6 +49,46 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:      func(r *http.Request) bool { return true },
 }
 
+// ---- Memory budget ----
+
+// memBudget caps the message bytes the relay holds in memory across all
+// connections: messages being read or forwarded, plus pending frames.
+// Without it, unauthenticated clients could make the relay hold up to
+// maxMessageBytes per connection, with no limit on connections.
+type memBudget struct {
+	max  int64
+	used atomic.Int64
+}
+
+// msgBudget is the relay-wide budget (nil means unlimited). Connections and
+// frame buffers capture it when they are created.
+var msgBudget *memBudget
+
+var errMemoryBudget = errors.New("relay memory budget exhausted")
+
+// reserve charges n bytes to the budget, or reports false if they don't fit.
+func (b *memBudget) reserve(n int) bool {
+	if b == nil {
+		return true
+	}
+	for {
+		used := b.used.Load()
+		if used+int64(n) > b.max {
+			return false
+		}
+		if b.used.CompareAndSwap(used, used+int64(n)) {
+			return true
+		}
+	}
+}
+
+// release returns n bytes to the budget.
+func (b *memBudget) release(n int) {
+	if b != nil {
+		b.used.Add(-int64(n))
+	}
+}
+
 // ---- Thread-safe WebSocket connection ----
 
 // conn wraps a gorilla WebSocket with a write mutex.
@@ -56,9 +98,72 @@ var upgrader = websocket.Upgrader{
 type conn struct {
 	mu sync.Mutex
 	ws *websocket.Conn
+
+	// budget is charged for the last message read until the next read;
+	// held is that charge. Both are used only by the reading goroutine.
+	budget *memBudget
+	held   int
 }
 
-func newConn(ws *websocket.Conn) *conn { return &conn{ws: ws} }
+func newConn(ws *websocket.Conn) *conn { return &conn{ws: ws, budget: msgBudget} }
+
+// readMessage is ws.ReadMessage, except that the message buffer is charged
+// to the memory budget while it is read and until the next readMessage or
+// releaseRead call. If the budget runs out, the connection is closed with
+// 1013 (Try Again Later) instead of buffering the message.
+func (c *conn) readMessage() (int, []byte, error) {
+	c.releaseRead()
+	msgType, r, err := c.ws.NextReader()
+	if err != nil {
+		return 0, nil, err
+	}
+	var msg []byte
+	for {
+		if len(msg) == cap(msg) {
+			// Charge the bigger buffer before allocating it; the old one is
+			// released once copied, so the charge matches what is live.
+			size := growCap(cap(msg))
+			if !c.budget.reserve(size) {
+				c.releaseRead()
+				slog.Warn("memory budget exhausted, closing connection", "maxBytes", c.budget.max)
+				c.close(websocket.CloseTryAgainLater, "Relay memory budget exhausted")
+				return 0, nil, errMemoryBudget
+			}
+			grown := make([]byte, len(msg), size)
+			copy(grown, msg)
+			c.releaseRead()
+			c.held, msg = size, grown
+		}
+		n, err := r.Read(msg[len(msg):cap(msg)])
+		msg = msg[:len(msg)+n]
+		if err == io.EOF {
+			return msgType, msg, nil
+		}
+		if err != nil {
+			c.releaseRead()
+			return 0, nil, err
+		}
+	}
+}
+
+// growCap returns the next read buffer size: like append, it doubles small
+// buffers and grows large ones by a quarter.
+func growCap(n int) int {
+	switch {
+	case n < 512:
+		return 512
+	case n < 256*1024:
+		return 2 * n
+	default:
+		return n + n/4
+	}
+}
+
+// releaseRead returns the last message read to the memory budget.
+func (c *conn) releaseRead() {
+	c.budget.release(c.held)
+	c.held = 0
+}
 
 func (c *conn) send(msgType int, data []byte) error {
 	c.mu.Lock()
@@ -82,54 +187,86 @@ type frameBuffer struct {
 	maxItems   int
 	maxBytes   int
 	totalBytes int
+	budget     *memBudget
 }
 
 func newFrameBuffer(maxItems int) *frameBuffer {
-	return &frameBuffer{maxItems: maxItems, maxBytes: maxPendingBytes}
+	return &frameBuffer{maxItems: maxItems, maxBytes: maxPendingBytes, budget: msgBudget}
 }
 
 // push stores a frame. Each frame is prefixed with a 1-byte msgType so it can
-// be replayed with the correct WebSocket message type.
+// be replayed with the correct WebSocket message type. The frame is dropped
+// if the memory budget cannot hold it.
 func (b *frameBuffer) push(msgType int, data []byte) {
-	frame := make([]byte, 1+len(data))
-	frame[0] = byte(msgType)
-	copy(frame[1:], data)
+	size := 1 + len(data)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	// Drop the new frame if it alone exceeds the byte limit.
-	if len(frame) > b.maxBytes {
+	if size > b.maxBytes {
+		return
+	}
+	if !b.budget.reserve(size) {
+		slog.Warn("memory budget exhausted, dropping buffered frame", "bytes", size)
 		return
 	}
 
 	// Evict oldest frames until we have room for the new one.
-	for b.totalBytes+len(frame) > b.maxBytes && len(b.frames) > 0 {
-		b.totalBytes -= len(b.frames[0])
-		b.frames = b.frames[1:]
+	for b.totalBytes+size > b.maxBytes && len(b.frames) > 0 {
+		b.dropOldest()
 	}
 
+	frame := make([]byte, size)
+	frame[0] = byte(msgType)
+	copy(frame[1:], data)
 	b.frames = append(b.frames, frame)
-	b.totalBytes += len(frame)
+	b.totalBytes += size
 
 	// Also enforce the item count limit by dropping oldest.
-	if len(b.frames) > b.maxItems {
-		dropped := b.frames[:len(b.frames)-b.maxItems]
-		for _, f := range dropped {
-			b.totalBytes -= len(f)
-		}
-		b.frames = b.frames[len(b.frames)-b.maxItems:]
+	for len(b.frames) > b.maxItems {
+		b.dropOldest()
 	}
 }
 
-// flush returns all buffered frames and clears the buffer.
-func (b *frameBuffer) flush() [][]byte {
+// dropOldest discards the oldest frame. b.mu must be held.
+func (b *frameBuffer) dropOldest() {
+	b.totalBytes -= len(b.frames[0])
+	b.budget.release(len(b.frames[0]))
+	b.frames[0] = nil // free it now, not when the slice is next reallocated
+	b.frames = b.frames[1:]
+}
+
+// take removes and returns all buffered frames; they stay charged to the
+// memory budget.
+func (b *frameBuffer) take() [][]byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := b.frames
 	b.frames = nil
 	b.totalBytes = 0
 	return out
+}
+
+// flush returns all buffered frames and clears the buffer.
+func (b *frameBuffer) flush() [][]byte {
+	out := b.take()
+	for _, f := range out {
+		b.budget.release(len(f))
+	}
+	return out
+}
+
+// drain sends the buffered frames in order and clears the buffer. Each frame
+// stays charged to the memory budget until it has been sent, so a peer that
+// stops reading cannot hold drained frames outside the budget.
+func (b *frameBuffer) drain(send func(msgType int, data []byte)) {
+	frames := b.take()
+	for i, frame := range frames {
+		send(int(frame[0]), frame[1:])
+		frames[i] = nil // sent: let the GC reclaim it while the rest go out
+		b.budget.release(len(frame))
+	}
 }
 
 // isEmpty reports whether the buffer holds no frames.
@@ -439,6 +576,7 @@ func (h *relayHandler) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := newConn(ws)
+	defer c.releaseRead() // in case a handler returns while holding a message
 
 	switch role {
 	case "server":
@@ -483,7 +621,7 @@ func (h *relayHandler) handleServerControl(sess *session, c *conn, serverId stri
 	}()
 
 	for {
-		msgType, msg, err := c.ws.ReadMessage()
+		msgType, msg, err := c.readMessage()
 		if err != nil {
 			break
 		}
@@ -520,12 +658,7 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 	p.mu.Lock()
 	buf := p.pending
 	p.mu.Unlock()
-	for _, frame := range buf.flush() {
-		if len(frame) == 0 {
-			continue
-		}
-		_ = c.send(int(frame[0]), frame[1:])
-	}
+	buf.drain(func(msgType int, data []byte) { _ = c.send(msgType, data) })
 
 	defer func() {
 		p.mu.Lock()
@@ -545,7 +678,7 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 	}()
 
 	for {
-		msgType, msg, err := c.ws.ReadMessage()
+		msgType, msg, err := c.readMessage()
 		if err != nil {
 			break
 		}
@@ -607,7 +740,7 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 	}()
 
 	for {
-		msgType, msg, err := c.ws.ReadMessage()
+		msgType, msg, err := c.readMessage()
 		if err != nil {
 			break
 		}
@@ -654,6 +787,7 @@ func envOrDefault(key, def string) string {
 func main() {
 	addr := flag.String("addr", envOrDefault("RELAY_ADDR", ":8411"), "listen address")
 	maxBuf := flag.Int("max-buffer-frames", 200, "max frames buffered per connection while daemon is connecting")
+	maxMemory := flag.Int("max-message-memory", 256, "max MiB of message data held in memory across all connections (0 = unlimited)")
 	logFormat := flag.String("log-format", envOrDefault("LOG_FORMAT", "text"), "log format: text or json")
 	printVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -672,6 +806,13 @@ func main() {
 		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
 	slog.SetDefault(slog.New(handler))
+
+	if *maxMemory > 0 {
+		msgBudget = &memBudget{max: int64(*maxMemory) << 20}
+		if msgBudget.max < 3*maxMessageBytes {
+			slog.Warn("max-message-memory below 96 may refuse maximum-size messages", "mib", *maxMemory)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
